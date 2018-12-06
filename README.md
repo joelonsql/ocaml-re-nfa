@@ -2,7 +2,9 @@
 
 This repository provides a library and executable for converting
 regular expressions into nondeterministic finite automata (NFAs) using
-[Glushkov's construction][glushkov], and for formatting the NFAs using
+[Glushkov's construction][glushkov], for converting NFAs into DFAs
+using the [powerset construction][powerset], for minimizing DFAs using
+[Brzozowski's algorithm][brzozowski] and for formatting the NFAs using
 [DOT][DOT] so that they can be displayed using [graphviz][graphviz].
 
 ### Online demo
@@ -13,7 +15,7 @@ by [Joel Jakobsson][joelonsql].
 ### The `re-nfa` executable
 
 The `re-nfa` executable accepts a single regular expression argument
-and prints a [DOT][DOT] graph for the corresponding NFA to standard
+and prints a [DOT][DOT] graph for the corresponding NFA or DFA to standard
 output.  For example, the following command
 
 ```
@@ -37,6 +39,16 @@ digraph {
 }
 ```
 
+To display the corresponding DFA or minimized DFA, pass the `-type` argument:
+
+```
+re-nfa -type dfa "a*b"
+```
+
+```
+re-nfa -type dfa-minimized "a*b"
+```
+
 On a Unix system you might pipe the output directly to `dot`, and then
 on to [`display`][display], like this:
 
@@ -48,9 +60,17 @@ to display the following graph:
 
 ![a*b](/images/astarb.png)
 
+Here is the minimized version:
+
+![a*b](/images/astarb-minimized.png)
+
 Here is a more complex graph constructed from the regex `a?a?a?aaa` that causes pathological backtracking behaviour in some engines, as described in Russ Cox's article [Regular Expression Matching Can Be Simple And Fast][simple-and-fast]:
 
 ![a?a?a?aaa](/images/aqaqaqaaa.png)
+
+and here is the corresponding DFA:
+
+![a?a?a?aaa](/images/aqaqaqaaa-dfa.png)
 
 ### Library
 
@@ -86,6 +106,17 @@ to DOT directed graphs and for pretty-printing the graphs:
 val digraph_of_nfa : Nfa.nfa -> digraph
 val format_digraph : Format.formatter -> digraph -> unit
 ```
+
+The [`Dfa`][dfa] module provides functions for converting between NFAs and DFAs,
+a DFA minimization function, and and an `accept` function for DFAs
+
+```ocaml
+val determinize : Nfa.nfa -> dfa
+val inject : dfa -> Nfa.nfa
+val minimize : dfa -> dfa
+val accept : dfa -> char list -> bool
+```
+
 
 ### Rationale
 
@@ -138,6 +169,9 @@ A [ReasonML port of this project][reason-port] is available.
 [ocaml-re]: https://github.com/ocaml/ocaml-re
 [nfa]: https://github.com/yallop/ocaml-re-nfa/blob/master/lib/nfa.mli
 [nfa_dot]: https://github.com/yallop/ocaml-re-nfa/blob/master/lib/nfa_dot.mli
+[dfa]: https://github.com/yallop/ocaml-re-nfa/blob/master/lib/dfa.mli
 [web-ui]: https://compiler.org/reason-re-nfa/src/index.html
 [reason-port]: https://github.com/joelonsql/reason-re-nfa
 [joelonsql]: https://github.com/joelonsql
+[powerset]: https://en.wikipedia.org/wiki/Powerset_construction
+[brzozowski]: https://dl.acm.org/citation.cfm?id=2526104
