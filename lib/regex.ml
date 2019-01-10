@@ -7,6 +7,7 @@ open Nfa
      to prevent a state explosion.)
  *)
 module C = Set.Make(Char)
+type charset = C.t
 
 (** A 'letter' is a character set paired with an identifier that
     uniquely identifies the character set within the regex *)
@@ -196,6 +197,8 @@ let chr c = Char (C.singleton c)
 let opt t = alt t eps
 let empty = Empty
 
+let oneof cs = match C.cardinal cs with 0 -> Empty | _ -> Char cs
+
 let range_ l h =
   let rec loop i h acc =
     if i = h then         C.add (Char.chr i) acc
@@ -203,7 +206,8 @@ let range_ l h =
   in loop (Char.code l) (Char.code h) C.empty
 
 let range l h = Char (range_ l h)
-let any = range (Char.chr 0) (Char.chr 255)
+let any_ = range_ (Char.chr 0) (Char.chr 255)
+let any = Char any_
 
 exception Parse_error of string
 
@@ -211,43 +215,185 @@ module Parse =
 struct
   exception Fail
 
+  module Bracket =
+  struct
+    (** Follows the POSIX spec
+          9.3.5 RE Bracket Expression
+           http://pubs.opengroup.org/onlinepubs/009696899/basedefs/xbd_chap09.html#tag_09_03_05
+        but there is currently no support for character classes.
+
+        Bracket expressions are delimited by [ and ], with an optional "complement"
+        operator ^ immediately after the [.  Special characters:
+           ^ (immediately after the opening [)
+           ] (except immediately after the opening [ or [^)
+           - (except at the beginning or end)                                   *)
+
+    type element = Char of char | Range of char * char
+    type t = { negated: bool; elements: element list }
+
+    let interpret { negated; elements } =
+      let s =
+        List.fold_right
+          (function Char c -> C.add c
+                  | Range (c1,c2) -> C.union (range_ c1 c2))
+          elements C.empty in
+      if negated then C.diff any_ s
+      else s
+
+    let parse_element = function
+      | [] -> raise Fail
+      | ']' :: s -> (None, s)
+      | c :: ('-' :: ']' :: _ as s) -> (Some (Char c), s)
+      | c1 :: '-' :: c2 :: s -> (Some (Range (c1, c2)), s)
+      | c :: s -> (Some (Char c), s)
+
+    let parse_initial = function
+      | [] -> raise Fail
+      | c :: ('-' :: ']' :: _ as s) -> (Some (Char c), s)
+      | c1 :: '-' :: c2 :: s -> (Some (Range (c1, c2)), s)
+      | c :: s -> (Some (Char c), s)
+
+    let parse_elements s = 
+      let rec loop elements s =
+        match parse_element s with
+        | None, s -> (List.rev elements, s)
+        | Some e, s -> loop (e :: elements) s in
+      match parse_initial s with
+      | None, s -> ([], s)
+      | Some e, s -> loop [e] s
+
+    type result = { hyphen: bool;
+                    caret: bool;
+                    lbracket: bool;
+                    ranges: (char * char) list; }
+    let ranges (set : C.t) =
+      let adjacent c1 c2 = abs (Char.code c1 - Char.code c2) = 1 in
+      match
+        C.fold
+          (fun c (co, r) ->
+            match c, co with
+            | '-', co -> (co, {r with hyphen = true})
+            | '^', co -> (co, {r with caret = true})
+            | ']', co -> (co, {r with lbracket = true})
+            | c, None -> (Some (c,c), r) 
+            | c, Some (c1,c2) when adjacent c c2 -> (Some (c1, c), r)
+            | c, Some (c1,c2) -> (Some (c,c),
+                                  { r with ranges = (c1,c2) :: r.ranges }))
+          set
+          (None, {hyphen = false; caret = false; lbracket = false; ranges = []})
+      with
+      | None  , r -> {r with ranges = List.rev r.ranges}
+      | Some p, r -> {r with ranges = List.rev (p :: r.ranges)}
+
+    let regex_specials = "*+?.|()["
+
+    let unparse ?(complement=false) (set : C.t) =
+      let pr = Printf.sprintf in
+      let r = ranges set in
+      let conc =
+        List.fold_left
+          (fun s (x,y) -> if x = y then pr "%c%s" x s
+                          else pr "%c-%c%s" x y s)
+          "" in
+      let whenever p s = if p then s else "" in
+      let bracket s = if complement then pr "[^%s]" s else pr "[%s]" s in
+      match r.ranges, r.lbracket, r.caret, r.hyphen with
+      | [(x,y)], false, false, false
+          (* If we have a single non-special character then
+             there's no need for a range expression *)
+           when x = y
+             && not complement
+             && not (String.contains regex_specials x) -> pr "%c" x
+      | _ :: _ as rs, lbracket, caret, hyphen ->
+         (* If we have some non-special characters then we don't need to
+            take extra care to avoid accidentally positioning special
+            characters like ^ the beginning or end *)
+         bracket @@
+         pr "%s%s%s%s"
+           (whenever lbracket "]")
+           (conc rs)
+           (whenever caret "^")
+           (whenever hyphen "-")
+      | [], true, _, _ ->
+         bracket (pr "]%s%s" (whenever r.caret "^") (whenever r.hyphen "-"))
+      | [], false, true , true  -> bracket "-^"
+      | [], false, true , false -> if complement then "[^^]" else "^"
+      | [], false, false, true  -> bracket "-"
+      | [], false, false, false -> pr "[%s%c-%c]"
+                                     (if complement then "" else "^")
+                                     (Char.chr 0) (Char.chr 255)
+  end
+
+  type t =
+    | Opt : t -> t
+    | Chr : char -> t 
+    | Alt : t * t -> t
+    | Seq : t * t -> t
+    | Star : t -> t
+    | Plus : t -> t
+    | Bracketed : Bracket.t -> t
+    | Any : t
+    | Eps : t
+
+  let rec interpret : t -> _ regex = function
+    | Opt t -> opt (interpret t)
+    | Chr c -> chr c
+    | Alt (l, r) -> alt (interpret l) (interpret r)
+    | Seq (l, r) -> seq (interpret l) (interpret r)
+    | Star t -> star (interpret t)
+    | Plus t -> plus (interpret t)
+    | Bracketed elements -> Char (Bracket.interpret elements)
+    | Any -> any
+    | Eps -> eps
+
+   (* We've seen [.  Special characters:
+        ^   (beginning of negation)  *)
+  let re_parse_bracketed : char list -> (t * char list) = function
+    | '^' :: s -> let elements, rest = Bracket.parse_elements s in
+                  (Bracketed { negated = true; elements }, rest)
+    | _ :: _ as s -> let elements, rest = Bracket.parse_elements s in
+                (Bracketed { negated = false; elements }, rest)
+    | [] -> raise Fail
+
   (** ratom ::= .
                 <character>
+                [ bracket ]
                 ( ralt )           *)
-  let rec re_parse_atom : char list -> (_ regex * char list) option = function
+  let rec re_parse_atom : char list -> (t * char list) option = function
     | '('::rest ->
        begin match re_parse_alt rest with
        | (r, ')' :: rest) -> Some (r, rest)
        | _ -> raise Fail
        end
+    | '['::rest -> Some (re_parse_bracketed rest)
     | [] | ((')'|'|'|'*'|'?'|'+') :: _) -> None
-    | '.' :: rest -> Some (any, rest)
-    | h :: rest -> Some (chr h, rest)
+    | '.' :: rest -> Some (Any, rest)
+    | h :: rest -> Some (Chr h, rest)
 
   (** rsuffixed ::= ratom
                     atom *  
                     atom +
                     atom ?         *)
- and re_parse_suffixed : char list -> (_ regex * char list) option =
+ and re_parse_suffixed : char list -> (t * char list) option =
     fun s -> match re_parse_atom s with
     | None -> None
-    | Some (r, '*' :: rest) -> Some (star r, rest)
-    | Some (r, '+' :: rest) -> Some (plus r, rest)
-    | Some (r, '?' :: rest) -> Some (opt r, rest)
+    | Some (r, '*' :: rest) -> Some (Star r, rest)
+    | Some (r, '+' :: rest) -> Some (Plus r, rest)
+    | Some (r, '?' :: rest) -> Some (Opt r, rest)
     | Some (r, rest) -> Some (r, rest)
 
   (** rseq ::= <empty>
                rsuffixed rseq      *)
-  and re_parse_seq (s: char list) =
+  and re_parse_seq : char list -> t * char list = fun (s: char list) ->
     match re_parse_suffixed s with
-    | None -> (eps, s)
-    | Some (r, rest) -> let r', s' = re_parse_seq rest in (seq r r', s')
+    | None -> (Eps, s)
+    | Some (r, rest) -> let r', s' = re_parse_seq rest in (Seq (r, r'), s')
 
   (** ralt ::= rseq
                rseq | ralt         *)
   and re_parse_alt (s: char list) =
     match re_parse_seq s with
-    | (r, '|' :: rest) -> let r', s' = re_parse_alt rest in (alt r r', s')
+    | (r, '|' :: rest) -> let r', s' = re_parse_alt rest in (Alt (r, r'), s')
     | (r, rest) -> (r, rest)
 
   let explode s =
@@ -262,4 +408,10 @@ struct
     | (_, _::_) -> raise (Parse_error s)
 end
 
-let parse = Parse.parse
+let parse s = Parse.(interpret (parse s))
+
+let unparse_charset s =
+  let pos = Parse.Bracket.unparse ~complement:false s
+  and neg = Parse.Bracket.unparse ~complement:true (C.diff any_ s) in
+  if String.length pos <= String.length neg then pos else neg
+              
